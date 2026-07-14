@@ -30,23 +30,81 @@ def _road_geometries():
     return lines
 
 
+# OSM highway 标签中英对照，用于给没有真实路名的路段拼一个可读的中文类型名
+_HIGHWAY_CN = {
+    "motorway": "高速公路", "motorway_link": "高速匝道",
+    "trunk": "干线道路", "trunk_link": "干线匝道",
+    "primary": "主干道", "primary_link": "主干道匝道",
+    "secondary": "次干道", "secondary_link": "次干道连接线",
+    "tertiary": "三级道路", "tertiary_link": "三级道路连接线",
+    "residential": "居住区道路", "living_street": "生活街道",
+    "service": "支路", "unclassified": "普通道路",
+    "footway": "人行步道", "pedestrian": "步行街",
+    "cycleway": "非机动车道", "path": "小路",
+    "track": "小道",
+}
+
+
+def _friendly_names(lines: list, needed_ids: list) -> dict:
+    """为 needed_ids 里没有真实 name 的路段生成一个可读中文名：
+    有真实名字的直接用；没有的，在全路网里找最近的一条"有名字的路"，
+    标成"近XX路 类型"；如果附近300m内也没有任何有名道路，就退化成
+    "类型+序号"（比如"支路12号"），比原来的 living_street路段(ID:51) 更像正常地名。"""
+    # 收集全路网所有有真实 name 的路段中点，作为最近邻参照
+    named_lons, named_lats, named_names = [], [], []
+    for feat in lines:
+        nm = feat["properties"].get("name")
+        if nm:
+            coords = feat["geometry"]["coordinates"]
+            mid = coords[len(coords) // 2]
+            named_lons.append(mid[0])
+            named_lats.append(mid[1])
+            named_names.append(nm)
+    named_lons, named_lats = np.array(named_lons), np.array(named_lats)
+
+    result = {}
+    type_counter = {}
+    for rid in needed_ids:
+        feat = lines[int(rid)]
+        props = feat["properties"]
+        coords = feat["geometry"]["coordinates"]
+        mid = coords[len(coords) // 2]
+        nm = props.get("name")
+        hwy = props.get("highway", "unclassified")
+        hwy_cn = _HIGHWAY_CN.get(hwy, "道路")
+
+        if nm:
+            result[rid] = nm
+            continue
+
+        if len(named_lons):
+            d = _haversine_m(mid[0], mid[1], named_lons, named_lats)
+            idx = int(np.argmin(d))
+            if d[idx] <= 300:
+                result[rid] = f"近{named_names[idx]}{hwy_cn}"
+                continue
+
+        type_counter[hwy_cn] = type_counter.get(hwy_cn, 0) + 1
+        result[rid] = f"{hwy_cn}{type_counter[hwy_cn]}号"
+    return result
+
+
 def load_road_risk() -> pd.DataFrame:
     """road_risk.csv 关联 roads.geojson 的名称/坐标/道路等级，返回按风险降序的完整路段表"""
     risk = pd.read_csv(DATA_DIR / "road_risk.csv")
     risk.columns = [c.strip().replace("\ufeff", "") for c in risk.columns]
 
     lines = _road_geometries()
+    ids = risk["路段ID"].astype(int).tolist()
+    friendly = _friendly_names(lines, ids)
 
     names, lons, lats, highway = [], [], [], []
-    for rid in risk["路段ID"]:
-        feat = lines[int(rid)]
+    for rid in ids:
+        feat = lines[rid]
         props = feat["properties"]
         coords = feat["geometry"]["coordinates"]
         mid = coords[len(coords) // 2]
-        nm = props.get("name")
-        if not nm:
-            nm = f"{props.get('highway','未命名')}路段(ID:{rid})"
-        names.append(nm)
+        names.append(friendly[rid])
         lons.append(mid[0])
         lats.append(mid[1])
         highway.append(props.get("highway", "未知"))
@@ -131,29 +189,36 @@ def _haversine_m(lon1, lat1, lon2, lat2):
     return 2 * r * np.arcsin(np.sqrt(a))
 
 
-def _weak_level(nearest_dist_m: float) -> str:
-    if nearest_dist_m > 3000:
-        return "严重不足"
-    if nearest_dist_m > 1500:
-        return "不足"
-    if nearest_dist_m > 800:
-        return "临界"
-    return "达标"
-
-
-_MEASURE_TEMPLATES = {
-    "严重不足": "增设高清探头×3，申请智能门禁",
-    "不足": "补充移动探头，设置规范停车棚",
-    "临界": "巡逻频次↑，连通路段同步提级",
-    "达标": "维持现有配置，纳入常态巡查",
-}
+@lru_cache(maxsize=1)
+def _network_camera_distance_baseline() -> np.ndarray:
+    """全路网（1311条路段）每条路段到最近摄像头的距离，用作薄弱度分档的基准分布。
+    用分位数而不是写死的绝对数值（800/1500/3000m），是因为高风险路段本身可能
+    整体偏远、系统性地离监控点较远——如果用固定阈值切，容易出现"全部路段落在
+    同一档"、看起来像写死数据的问题；用相对分位数能保证薄弱度有区分度。"""
+    risk = load_road_risk()
+    fac = load_facility_points()
+    cams = fac[fac["facility_type"] == "监控摄像头"]
+    dists = np.empty(len(risk))
+    for i, (lon, lat) in enumerate(zip(risk["lon"], risk["lat"])):
+        d = _haversine_m(lon, lat, cams["lon"].values, cams["lat"].values)
+        dists[i] = d.min()
+    return dists
 
 
 def infra_overlap_real(top_n: int = 10):
-    """高风险路段关联 facility_points.csv 中的真实监控摄像头点位，计算最近摄像头距离与 500m/1500m 范围内点位数"""
+    """高风险路段关联 facility_points.csv 中的真实监控摄像头点位：
+    - 最近摄像头距离 / 1.5km 范围内点位数：直接计算，无改动
+    - 薄弱度：按全路网距离分布的25/50/75分位数动态分档（而非固定绝对阈值）
+    - 优先级：综合"风险值排名"与"监控薄弱程度排名"两个维度打分后三等分，
+      避免因为这批路段风险值/薄弱度普遍偏高，导致优先级全员挤在 P1
+    - 建议措施：把该路段的实际距离、探头数嵌入文案，逐行动态生成，不再是一句写死的话
+    """
     risk = load_road_risk().head(top_n).copy().reset_index(drop=True)
     fac = load_facility_points()
     cams = fac[fac["facility_type"] == "监控摄像头"]
+
+    baseline = _network_camera_distance_baseline()
+    q25, q50, q75 = np.percentile(baseline, [25, 50, 75])
 
     nearest_dist, nearby_count = [], []
     for lon, lat in zip(risk["lon"], risk["lat"]):
@@ -163,11 +228,43 @@ def infra_overlap_real(top_n: int = 10):
 
     risk["最近监控点距离(m)"] = [round(d) for d in nearest_dist]
     risk["1.5km范围内监控点数"] = nearby_count
-    risk["薄弱度"] = [_weak_level(d) for d in nearest_dist]
-    risk["建议措施"] = risk["薄弱度"].map(_MEASURE_TEMPLATES)
-    risk["优先级"] = risk.apply(
-        lambda r: "P1" if r["薄弱度"] == "严重不足" else ("P2" if r["薄弱度"] in ("不足", "临界") else "P3"), axis=1
-    )
+
+    def weak_level(d):
+        if d >= q75:
+            return "严重不足"
+        if d >= q50:
+            return "不足"
+        if d >= q25:
+            return "临界"
+        return "达标"
+
+    risk["薄弱度"] = [weak_level(d) for d in nearest_dist]
+
+    # 优先级：风险值排名 + 距离远近排名，两个排名相加后三等分
+    risk_rank = risk["风险值"].rank(ascending=False, method="min").values
+    dist_rank = pd.Series(nearest_dist).rank(ascending=False, method="min").values
+    combined = risk_rank + dist_rank
+    t1, t2 = np.percentile(combined, [33.3, 66.7])
+
+    def priority(c):
+        if c <= t1:
+            return "P1"
+        if c <= t2:
+            return "P2"
+        return "P3"
+
+    risk["优先级"] = [priority(c) for c in combined]
+
+    def measure(row):
+        d, cnt = row["最近监控点距离(m)"], row["1.5km范围内监控点数"]
+        if row["优先级"] == "P1":
+            return f"最近监控点{d}m外，1.5km内仅{cnt}个探头，建议优先增设高清探头并申请智能门禁"
+        if row["优先级"] == "P2":
+            return f"最近监控点{d}m，1.5km内{cnt}个探头，建议补充移动探头或加装规范停车棚位"
+        return f"最近监控点{d}m，1.5km内{cnt}个探头，建议提升巡逻频次、纳入联动巡查即可"
+
+    risk["建议措施"] = risk.apply(measure, axis=1)
+
     return risk[["路段名称", "风险值", "最近监控点距离(m)", "1.5km范围内监控点数", "薄弱度",
                  "建议措施", "优先级", "lon", "lat"]]
 
