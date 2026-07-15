@@ -13,7 +13,7 @@ def inject_base_css():
         <style>
             /* 收紧默认留白，贴近截图里的紧凑仪表盘风格 */
             .block-container {{
-                padding-top: 1rem;
+                padding-top: 3.5rem;
                 padding-bottom: 2rem;
                 max-width: 1400px;
             }}
@@ -25,7 +25,9 @@ def inject_base_css():
                 background: #ffffff;
                 border-bottom: 1px solid #eaeaea;
                 padding: 10px 18px;
-                margin: -1rem -1rem 1.2rem -1rem;
+                margin: 0 -1rem 1.2rem -1rem;
+                position: relative;
+                z-index: 1;
             }}
             .topbar-left {{
                 display: flex;
